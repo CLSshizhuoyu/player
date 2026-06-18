@@ -1,30 +1,45 @@
 # -*- coding: utf-8 -*-
 """
-MusicPlayer - 基于 PyQt5 的分类音乐播放器
+MusicPlayer - 基于 PyQt5 + VLC 的分类音乐播放器
 功能：
   1. 给定音乐文件夹，自动扫描音乐文件
   2. 通过 JSON 为每首歌指定唯一编码、分类信息（种类/语言/年代等）、歌词路径
   3. 按分类标准筛选歌曲并播放
   4. 支持显示 LRC 歌词（逐行高亮滚动）
   5. 提供元数据编辑界面
+  6. 进度条点击跳转、播放/暂停合一、支持常见音频格式
 """
 
-import sys, os, json, re, time
-from pathlib import Path
+import sys
+import os
+import json
+import re
+import vlc
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QListWidget, QListWidgetItem,
     QFileDialog, QSlider, QTextEdit, QGroupBox, QMessageBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QDialog, QDialogButtonBox,
-    QTabWidget, QSplitter, QFrame
+    QTableWidget, QTableWidgetItem, QHeaderView, QDialog, QSplitter
 )
-from PyQt5.QtCore import Qt, QTimer, QUrl, QSize
-from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-from PyQt5.QtGui import QFont, QColor, QTextCharFormat, QCursor
+from PyQt5.QtCore import Qt, QTimer, QUrl, QSize, pyqtSignal
+from PyQt5.QtGui import QFont, QColor, QTextCharFormat, QTextCursor, QMouseEvent
 
 # ─── 常量 ────────────────────────────────────────────────
 SUPPORTED_FORMATS = {".mp3", ".flac", ".aac", ".ogg", ".wav", ".m4a"}
 JSON_FILENAME = "music_library.json"
+
+# ─── 自定义进度条（支持点击跳转）─────────────────────────
+class ClickableSlider(QSlider):
+    """重写鼠标按下事件，使点击轨道直接跳转到点击位置"""
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton:
+            # 计算点击位置的比例
+            ratio = event.x() / self.width()
+            value = self.minimum() + (self.maximum() - self.minimum()) * ratio
+            self.setValue(int(value))
+            self.sliderMoved.emit(int(value))  # 触发跳转信号
+        else:
+            super().mousePressEvent(event)
 
 # ─── LRC 歌词解析 ────────────────────────────────────────
 def parse_lrc(lrc_path):
@@ -53,16 +68,16 @@ class MetadataEditor(QDialog):
     """用于编辑每首歌的 JSON 元数据"""
     def __init__(self, library_data, music_dir, parent=None):
         super().__init__(parent)
-        self.library = library_data          # list of dict
+        self.library = library_data
         self.music_dir = music_dir
         self.setWindowTitle("元数据编辑器")
         self.resize(900, 500)
         self._build_ui()
+        self.last_highlight_start = -1
+        self.last_highlight_end = -1
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-
-        # 工具栏
         toolbar = QHBoxLayout()
         btn_scan = QPushButton("扫描文件夹（添加新文件）")
         btn_scan.clicked.connect(self._scan_new_files)
@@ -73,14 +88,12 @@ class MetadataEditor(QDialog):
         toolbar.addWidget(btn_save)
         layout.addLayout(toolbar)
 
-        # 表格
         self.table = QTableWidget()
         headers = ["唯一编码", "文件名", "种类", "语言", "年代", "艺术家", "歌词路径"]
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.table)
-
         self._refresh_table()
 
     def _refresh_table(self):
@@ -102,7 +115,7 @@ class MetadataEditor(QDialog):
     def _scan_new_files(self):
         existing = {e["filename"] for e in self.library}
         added = 0
-        next_id = max([int(e["id"]) for e in self.library if str(e.get("id","")).isdigit()] + [0]) + 1
+        next_id = max([int(e["id"]) for e in self.library if str(e.get("id", "")).isdigit()] + [0]) + 1
         for f in sorted(os.listdir(self.music_dir)):
             ext = os.path.splitext(f)[1].lower()
             if ext in SUPPORTED_FORMATS and f not in existing:
@@ -121,7 +134,6 @@ class MetadataEditor(QDialog):
         QMessageBox.information(self, "扫描完成", f"新增 {added} 个文件。")
 
     def _save_json(self):
-        # 从表格读回数据
         for row in range(self.table.rowCount()):
             entry = self.library[row]
             entry["id"]       = self.table.item(row, 0).text()
@@ -136,7 +148,6 @@ class MetadataEditor(QDialog):
             json.dump(self.library, f, ensure_ascii=False, indent=2)
         QMessageBox.information(self, "已保存", f"元数据已保存到:\n{json_path}")
 
-
 # ─── 主窗口 ──────────────────────────────────────────────
 class MusicPlayer(QMainWindow):
     def __init__(self):
@@ -144,16 +155,22 @@ class MusicPlayer(QMainWindow):
         self.setWindowTitle("🎵 分类音乐播放器")
         self.resize(1100, 680)
         self.music_dir = ""
-        self.library = []             # JSON 数据
-        self.lrc_lines = []           # 当前歌词
+        self.library = []
+        self.lrc_lines = []
         self.current_lrc_index = -1
+        self.is_playing = False
 
-        # 播放器
-        self.player = QMediaPlayer()
-        self.player.positionChanged.connect(self._on_position_changed)
-        self.player.durationChanged.connect(self._on_duration_changed)
+        # ── VLC 播放器初始化 ──
+        self.vlc_instance = vlc.Instance("--no-xlib --quiet")
+        self.player = self.vlc_instance.media_player_new()
+        self.player.audio_set_volume(80)
 
-        # 歌词刷新定时器
+        # 定时器轮询进度
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self._update_ui)
+        self.update_timer.start(100)
+
+        # 歌词定时器
         self.lrc_timer = QTimer(self)
         self.lrc_timer.timeout.connect(self._update_lyrics)
         self.lrc_timer.start(200)
@@ -167,7 +184,7 @@ class MusicPlayer(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
 
-        # ── 顶部：文件夹选择 ──
+        # 顶部：文件夹选择
         top = QHBoxLayout()
         top.addWidget(QLabel("音乐文件夹:"))
         self.lbl_dir = QLabel("（未选择）")
@@ -181,15 +198,13 @@ class MusicPlayer(QMainWindow):
         top.addWidget(btn_edit)
         root.addLayout(top)
 
-        # ── 中部：左侧筛选+列表 | 右侧歌词 ──
+        # 中部：左侧筛选+列表 | 右侧歌词
         splitter = QSplitter(Qt.Horizontal)
 
-        # 左侧面板
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0,0,0,0)
+        left_layout.setContentsMargins(0, 0, 0, 0)
 
-        # 分类选择组
         grp_filter = QGroupBox("分类筛选")
         fl = QHBoxLayout(grp_filter)
         fl.addWidget(QLabel("标准:"))
@@ -201,30 +216,47 @@ class MusicPlayer(QMainWindow):
         fl.addWidget(self.cmb_value, 1)
         left_layout.addWidget(grp_filter)
 
-        # 歌曲列表
         grp_list = QGroupBox("歌曲列表")
         ll = QVBoxLayout(grp_list)
         self.list_songs = QListWidget()
         self.list_songs.doubleClicked.connect(self._play_selected)
         ll.addWidget(self.list_songs)
 
-        # 播放控制
+        # 播放控制（合并播放/暂停）
         ctrl = QHBoxLayout()
         self.btn_prev = QPushButton("⏮ 上一首")
-        self.btn_play = QPushButton("▶ 播放")
-        self.btn_pause = QPushButton("⏸ 暂停")
+        self.btn_play_pause = QPushButton("▶ 播放")
         self.btn_stop = QPushButton("⏹ 停止")
         self.btn_next = QPushButton("⏭ 下一首")
-        for b in [self.btn_prev, self.btn_play, self.btn_pause, self.btn_stop, self.btn_next]:
+        for b in [self.btn_prev, self.btn_play_pause, self.btn_stop, self.btn_next]:
             ctrl.addWidget(b)
         ll.addLayout(ctrl)
 
-        # 进度条
+        # 进度条（自定义点击跳转）
         prog = QHBoxLayout()
         self.lbl_time = QLabel("00:00 / 00:00")
-        self.slider = QSlider(Qt.Horizontal)
+        self.slider = ClickableSlider(Qt.Horizontal)
         self.slider.setRange(0, 0)
         self.slider.sliderMoved.connect(self._seek)
+        self.slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 8px;
+                background: #e0e0e0;
+                border-radius: 4px;
+            }
+            QSlider::sub-page:horizontal {
+                background: white;
+                height: 8px;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #2196F3;
+                width: 16px;
+                height: 16px;
+                margin: -4px 0;
+                border-radius: 8px;
+            }
+        """)
         prog.addWidget(self.slider, 1)
         prog.addWidget(self.lbl_time)
         ll.addLayout(prog)
@@ -232,15 +264,19 @@ class MusicPlayer(QMainWindow):
         left_layout.addWidget(grp_list, 1)
         splitter.addWidget(left_panel)
 
-        # 右侧：歌词显示
+        # 右侧：歌词
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0,0,0,0)
+        right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.addWidget(QLabel("🎼 歌词"))
         self.txt_lyrics = QTextEdit()
         self.txt_lyrics.setReadOnly(True)
         self.txt_lyrics.setAlignment(Qt.AlignCenter)
-        self.txt_lyrics.setStyleSheet("font-size: 16px; background: #1e1e1e; color: #cccccc;")
+        self.txt_lyrics.setStyleSheet("""
+            font-size: 16px; 
+            background: white; 
+            color: #333333;
+        """)
         right_layout.addWidget(self.txt_lyrics, 1)
         self.lbl_now_playing = QLabel("未播放")
         self.lbl_now_playing.setStyleSheet("font-size: 14px; font-weight: bold; color: #2196F3;")
@@ -251,7 +287,6 @@ class MusicPlayer(QMainWindow):
         splitter.setSizes([500, 450])
         root.addWidget(splitter, 1)
 
-        # 样式
         self.setStyleSheet("""
             QMainWindow { background: #f5f5f5; }
             QGroupBox { font-weight: bold; border: 1px solid #ddd; border-radius: 6px; margin-top: 8px; padding-top: 12px; }
@@ -261,21 +296,80 @@ class MusicPlayer(QMainWindow):
             QPushButton:pressed { background: #0D47A1; }
             QListWidget { border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
             QComboBox { padding: 4px; border: 1px solid #ccc; border-radius: 4px; }
-            QSlider::groove:horizontal { height: 6px; background: #ddd; border-radius: 3px; }
-            QSlider::handle:horizontal { width: 14px; height: 14px; background: #2196F3; border-radius: 7px; margin: -4px 0; }
         """)
 
     def _build_connections(self):
         self.cmb_category.currentIndexChanged.connect(self._update_values)
         self.cmb_value.currentIndexChanged.connect(self._filter_songs)
         self.btn_prev.clicked.connect(self._play_prev)
-        self.btn_play.clicked.connect(self._play_current)
-        self.btn_pause.clicked.connect(self.player.pause)
+        self.btn_play_pause.clicked.connect(self._toggle_play_pause)
         self.btn_stop.clicked.connect(self._stop)
         self.btn_next.clicked.connect(self._play_next)
-        self.player.stateChanged.connect(self._on_state_changed)
 
-    # ─── 文件夹 / JSON 加载 ─────────────────────────────
+    # ─── VLC 播放控制 ─────────────────────────────────────
+    def _set_media(self, filepath):
+        media = self.vlc_instance.media_new(filepath)
+        self.player.set_media(media)
+        self.slider.setRange(0, self.player.get_length() or 0)
+
+    def _play(self):
+        self.player.play()
+        self.is_playing = True
+        self.btn_play_pause.setText("⏸ 暂停")
+
+    def _pause(self):
+        self.player.pause()
+        self.is_playing = False
+        self.btn_play_pause.setText("▶ 播放")
+
+    def _toggle_play_pause(self):
+        if self.player.get_state() == vlc.State.Playing:
+            self._pause()
+        else:
+            self._play()
+
+    def _stop(self):
+        self.player.stop()
+        self.is_playing = False
+        self.btn_play_pause.setText("▶ 播放")
+        self.slider.setValue(0)
+        self.lbl_time.setText("00:00 / 00:00")
+        self.lbl_now_playing.setText("已停止")
+        self.txt_lyrics.clear()
+        self.lrc_lines = []
+        self.current_lrc_index = -1
+
+    # ─── 修正：正确转换毫秒→播放比例 ─────────────────────
+    def _seek(self, pos_ms):
+        """定位到指定毫秒位置（根据总时长转换为 0~1 比例）"""
+        length = self.player.get_length()
+        if length > 0:
+            ratio = pos_ms / length
+            # 防止因浮点误差超出范围
+            ratio = max(0.0, min(1.0, ratio))
+            self.player.set_position(ratio)
+        # 如果 length 为 0（未加载媒体），则忽略
+
+    # ─── UI 更新（定时器） ────────────────────────────────
+    def _update_ui(self):
+        if not self.player.get_media():
+            return
+        length = self.player.get_length()
+        if length > 0:
+            pos = self.player.get_position() * length
+            self.slider.setRange(0, length)
+            if not self.slider.isSliderDown():
+                self.slider.setValue(int(pos))
+            self.lbl_time.setText(f"{self._fmt(int(pos))} / {self._fmt(length)}")
+        else:
+            self.slider.setRange(0, 0)
+            self.lbl_time.setText("00:00 / 00:00")
+
+        # 自动下一首
+        if length > 0 and self.player.get_state() == vlc.State.Ended:
+            self._play_next()
+
+    # ─── 文件夹 / JSON 加载（保持不变）─────────────────
     def _open_folder(self):
         d = QFileDialog.getExistingDirectory(self, "选择音乐文件夹")
         if not d:
@@ -300,13 +394,11 @@ class MusicPlayer(QMainWindow):
         self._filter_songs()
 
     def _auto_generate_json(self):
-        """扫描文件夹，为每个音乐文件生成默认条目"""
         self.library = []
         idx = 1
         for f in sorted(os.listdir(self.music_dir)):
             ext = os.path.splitext(f)[1].lower()
             if ext in SUPPORTED_FORMATS:
-                # 尝试同名 .lrc
                 lrc_candidate = os.path.splitext(f)[0] + ".lrc"
                 lrc_path = lrc_candidate if os.path.exists(os.path.join(self.music_dir, lrc_candidate)) else ""
                 self.library.append({
@@ -330,7 +422,6 @@ class MusicPlayer(QMainWindow):
             return
         dlg = MetadataEditor(self.library, self.music_dir, self)
         dlg.exec_()
-        # 编辑后刷新
         self._update_values()
         self._filter_songs()
 
@@ -383,11 +474,6 @@ class MusicPlayer(QMainWindow):
     def _play_selected(self, index):
         self._play_row(index.row())
 
-    def _play_current(self):
-        row = self._get_current_row()
-        if row >= 0:
-            self._play_row(row)
-
     def _play_row(self, row):
         if row < 0 or row >= self.list_songs.count():
             return
@@ -397,9 +483,8 @@ class MusicPlayer(QMainWindow):
         if not os.path.exists(filepath):
             QMessageBox.warning(self, "错误", f"文件不存在:\n{filepath}")
             return
-        url = QUrl.fromLocalFile(filepath)
-        self.player.setMedia(QMediaContent(url))
-        self.player.play()
+        self._set_media(filepath)
+        self._play()
         self.lbl_now_playing.setText(f"正在播放: {entry['filename']}")
         self._load_lyrics(entry)
 
@@ -415,37 +500,12 @@ class MusicPlayer(QMainWindow):
             self.list_songs.setCurrentRow(row + 1)
             self._play_row(row + 1)
 
-    def _stop(self):
-        self.player.stop()
-        self.lbl_now_playing.setText("已停止")
-        self.txt_lyrics.clear()
-
-    def _on_state_changed(self, state):
-        if state == QMediaPlayer.StoppedState and self.player.position() >= self.player.duration() - 500 and self.player.duration() > 0:
-            # 自动下一首
-            self._play_next()
-
-    # ─── 进度 ────────────────────────────────────────────
-    def _on_position_changed(self, pos):
-        self.slider.setValue(pos)
-        dur = self.player.duration()
-        self.lbl_time.setText(f"{self._fmt(pos)} / {self._fmt(dur)}")
-
-    def _on_duration_changed(self, dur):
-        self.slider.setRange(0, dur)
-
-    def _seek(self, pos):
-        self.player.setPosition(pos)
-
-    @staticmethod
-    def _fmt(ms):
-        s = ms // 1000
-        return f"{s//60:02d}:{s%60:02d}"
-
     # ─── 歌词 ────────────────────────────────────────────
     def _load_lyrics(self, entry):
         self.lrc_lines = []
         self.current_lrc_index = -1
+        self.last_highlight_start = -1
+        self.last_highlight_end = -1
         lrc_rel = entry.get("lyrics", "")
         if lrc_rel:
             lrc_path = os.path.join(self.music_dir, lrc_rel)
@@ -453,42 +513,93 @@ class MusicPlayer(QMainWindow):
         if self.lrc_lines:
             full_text = "\n".join(line[1] for line in self.lrc_lines)
             self.txt_lyrics.setPlainText(full_text)
+            # 将全部行设为默认深灰色
+            cursor = self.txt_lyrics.textCursor()
+            cursor.select(QTextCursor.Document)
+            fmt_default = QTextCharFormat()
+            fmt_default.setForeground(QColor("#333333"))
+            cursor.setCharFormat(fmt_default)
+            cursor.clearSelection()
+            self.txt_lyrics.setTextCursor(cursor)
         else:
             self.txt_lyrics.setPlainText("（无歌词）")
 
     def _update_lyrics(self):
         if not self.lrc_lines:
             return
-        pos_sec = self.player.position() / 1000.0
+        length = self.player.get_length()
+        if length <= 0:
+            return
+        pos_sec = self.player.get_position() * (length / 1000.0)
+
         idx = -1
         for i, (t, _) in enumerate(self.lrc_lines):
             if t <= pos_sec:
                 idx = i
             else:
                 break
-        if idx != self.current_lrc_index and idx >= 0:
-            self.current_lrc_index = idx
-            cursor = self.txt_lyrics.textCursor()
-            cursor.select(cursor.Document)
-            fmt_default = QTextCharFormat()
-            fmt_default.setForeground(QColor("#cccccc"))
-            cursor.setCharFormat(fmt_default)
 
-            # 高亮当前行
-            block = self.txt_lyrics.document().findBlockByNumber(idx)
-            if block.isValid():
-                cur2 = self.txt_lyrics.textCursor()
-                cur2.setPosition(block.position())
-                cur2.setPosition(block.position() + block.length() - 1, cursor.KeepAnchor)
-                fmt_hi = QTextCharFormat()
-                fmt_hi.setForeground(QColor("#FFD700"))
-                fmt_hi.setFontWeight(QFont.Bold)
-                cur2.setCharFormat(fmt_hi)
+        if idx == self.current_lrc_index and idx >= 0:
+            return
 
-                # 滚动到当前行
-                self.txt_lyrics.setTextCursor(cur2)
-                self.txt_lyrics.ensureCursorVisible()
+        doc = self.txt_lyrics.document()
 
+        # 重置旧高亮组
+        if self.last_highlight_start >= 0 and self.last_highlight_end >= 0:
+            for i in range(self.last_highlight_start, self.last_highlight_end + 1):
+                block = doc.findBlockByNumber(i)
+                if block.isValid():
+                    cur = QTextCursor(block)
+                    cur.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)  # ← 修正
+                    fmt_default = QTextCharFormat()
+                    fmt_default.setForeground(QColor("#333333"))
+                    cur.setCharFormat(fmt_default)
+
+        self.current_lrc_index = idx
+
+        if idx == -1:
+            self.last_highlight_start = -1
+            self.last_highlight_end = -1
+            return
+
+        current_time = self.lrc_lines[idx][0]
+        start_idx = idx
+        while start_idx > 0 and self.lrc_lines[start_idx - 1][0] == current_time:
+            start_idx -= 1
+        end_idx = idx
+        while end_idx < len(self.lrc_lines) - 1 and self.lrc_lines[end_idx + 1][0] == current_time:
+            end_idx += 1
+
+        # 高亮新组：第一行黄色，其余绿色
+        for i in range(start_idx, end_idx + 1):
+            block = doc.findBlockByNumber(i)
+            if not block.isValid():
+                continue
+            cur = QTextCursor(block)
+            cur.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)  # ← 修正
+            fmt = QTextCharFormat()
+            if i == start_idx:
+                fmt.setForeground(QColor("#FFD700"))
+                fmt.setFontWeight(QFont.Bold)
+            else:
+                fmt.setForeground(QColor("#32CD32"))
+            cur.setCharFormat(fmt)
+            cur.clearSelection()
+
+        self.last_highlight_start = start_idx
+        self.last_highlight_end = end_idx
+
+        first_block = doc.findBlockByNumber(start_idx)
+        if first_block.isValid():
+            cursor = QTextCursor(first_block)
+            cursor.setPosition(first_block.position())
+            self.txt_lyrics.setTextCursor(cursor)
+            self.txt_lyrics.ensureCursorVisible()
+
+    @staticmethod
+    def _fmt(ms):
+        s = ms // 1000
+        return f"{s//60:02d}:{s%60:02d}"
 
 # ─── 入口 ────────────────────────────────────────────────
 if __name__ == "__main__":
